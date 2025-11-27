@@ -5,17 +5,22 @@ import faiss
 from sentence_transformers import SentenceTransformer
 import os
 
+# Force CPU execution
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 # ============================================================
 # 1. Load LLM + Embedding Model (cached)
 # ============================================================
 @st.cache_resource
 def load_llm():
-    model_name = "aisingapore/Qwen-SEA-LION-v4-32B-IT-4BIT"  # Practical version
+    model_name = "meta-llama/Llama-3.2-1B-Instruct"   # 🔥 CPU-friendly
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
-        device_map="auto"
+        dtype=torch.float32,            # 🔥 FIX: FP16 breaks CPU on Streamlit
+        device_map=None,                # 🔥 FIX: avoid accelerate/GPU mapping
+        low_cpu_mem_usage=True
     )
     return tokenizer, model
 
@@ -27,14 +32,11 @@ tokenizer, model = load_llm()
 embedder = load_embedder()
 
 # ============================================================
-# 2. App UI Settings (Sidebar)
+# 2. Sidebar
 # ============================================================
 st.sidebar.title("⚙️ Settings")
-
-# Thinking Mode Toggle
 thinking_mode = st.sidebar.checkbox("Enable Thinking Mode", value=False)
 
-# Language options
 languages = {
     "English": "en",
     "Malay": "ms",
@@ -47,14 +49,12 @@ languages = {
 }
 selected_language = st.sidebar.selectbox("App Language", list(languages.keys()))
 
-# System Prompt
 system_prompt = st.sidebar.text_area(
-    "System Prompt (Persona / Instructions)",
-    value="You are SEA-LION, a helpful multilingual assistant.",
+    "System Prompt",
+    value="You are a multilingual helpful assistant.",
     height=120
 )
 
-# RAG document uploader
 uploaded_files = st.sidebar.file_uploader(
     "Upload documents (PDF/TXT)",
     type=["txt", "pdf"],
@@ -62,7 +62,7 @@ uploaded_files = st.sidebar.file_uploader(
 )
 
 # ============================================================
-# 3. RAG: Build vector store
+# 3. RAG: Vector Store
 # ============================================================
 if "doc_index" not in st.session_state:
     st.session_state.doc_index = None
@@ -98,7 +98,6 @@ def chunk_text(text, chunk_size=400):
     words = text.split()
     return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
 
-# Build RAG index
 if uploaded_files:
     st.sidebar.write("Processing documents…")
     index, texts = process_uploaded_files(uploaded_files)
@@ -107,9 +106,9 @@ if uploaded_files:
     st.sidebar.success("RAG data ready!")
 
 # ============================================================
-# 4. Chat history
+# 4. Chat History
 # ============================================================
-st.title("🦁 SEA-LION Enhanced Chat App")
+st.title("🦁 SEA-LION Enhanced Chat App (CPU Compatible)")
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
@@ -124,57 +123,46 @@ def retrieve(query, k=3):
         return ""
     q_emb = embedder.encode([query], convert_to_numpy=True)
     scores, idxs = st.session_state.doc_index.search(q_emb, k)
-    retrieved = [st.session_state.doc_texts[i] for i in idxs[0]]
-    return "\n\n".join(retrieved)
+    return "\n\n".join(st.session_state.doc_texts[i] for i in idxs[0])
 
 # ============================================================
 # 6. Chat Interface
 # ============================================================
-# Display chat history
 for msg in st.session_state.messages:
     if msg["role"] == "user":
         st.chat_message("user").write(msg["content"])
     elif msg["role"] == "assistant":
         st.chat_message("assistant").write(msg["content"])
 
-# User message input
 user_input = st.chat_input("Type your message…")
 
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
     st.chat_message("user").write(user_input)
 
-    # Retrieve context if RAG active
     rag_context = retrieve(user_input)
-    if rag_context:
-        rag_block = f"\n\n[Relevant Context from Documents]\n{rag_context}\n\n"
-    else:
-        rag_block = ""
+    rag_block = f"\n\n[Context]\n{rag_context}\n\n" if rag_context else ""
 
-    # Prepare chat messages
     messages_for_model = [
-        st.session_state.messages[0],  # system prompt
+        st.session_state.messages[0],
         *st.session_state.messages[1:]
     ]
-
-    # Inject RAG context into last user message
     if rag_block:
         messages_for_model[-1]["content"] += rag_block
 
     prompt_text = tokenizer.apply_chat_template(
         messages_for_model,
         tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=thinking_mode
+        add_generation_prompt=True
     )
 
-    inputs = tokenizer([prompt_text], return_tensors="pt").to(model.device)
+    inputs = tokenizer([prompt_text], return_tensors="pt")
 
     with st.spinner("Generating response…"):
         output_ids = model.generate(
             **inputs,
             max_new_tokens=512,
-            temperature=0.7
+            temperature=0.7,
         )
 
     result = tokenizer.decode(
